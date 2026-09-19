@@ -13,10 +13,19 @@
     confirmPair: null,   // 当前确认弹窗对应的交接项 { fromId, toId }
     view: "sample",      // 主区域当前视图：sample（样本详情）| queue（异常处置队列）
     queue: {
-      filters: { status: "open", code: "", custodian: "", time_from: "", time_to: "" },
+      filters: { status: "open", code: "", custodian: "", time_from: "", time_to: "", claim: "" },
       data: null,        // 最近一次队列响应
       dispose: null,     // 当前处置弹窗目标 { fp, version, action }
+      claim: null,       // 当前认领弹窗目标 { fp, version, mode }
+      serverOffsetMs: 0, // 服务器时间与本地时间差，用于倒计时
     },
+  };
+
+  // 当前浏览器记住的处置人（同一人可直接认领 / 释放；切换人员时手填即可）
+  const HANDLER_STORAGE_KEY = "audit-current-handler";
+  const currentHandler = () => localStorage.getItem(HANDLER_STORAGE_KEY) || "";
+  const rememberHandler = (name) => {
+    if (name) localStorage.setItem(HANDLER_STORAGE_KEY, name);
   };
 
   // ---------- 工具 ----------
@@ -594,9 +603,14 @@
     if (f.custodian) params.set("custodian", f.custodian);
     if (f.time_from) params.set("time_from", f.time_from);
     if (f.time_to) params.set("time_to", f.time_to);
+    if (f.claim) params.set("claim", f.claim);
     try {
       const data = await api(`/api/findings/queue?${params.toString()}`);
       state.queue.data = data;
+      if (data.server_time) {
+        state.queue.serverOffsetMs =
+          new Date(data.server_time.replace(" ", "T")).getTime() - Date.now();
+      }
       renderQueue();
       updateQueueBadge(data.summary);
     } catch (err) {
@@ -610,12 +624,13 @@
     const s = data.summary || {};
     $("#queue-stats").innerHTML = [
       statChip(s.open ?? 0, "未处理", s.open ? "bad" : ""),
+      statChip(s.claimed ?? 0, "认领中", s.claimed ? "warn" : ""),
       statChip(s.resolved ?? 0, "已处理", "ok"),
       statChip(s.eliminated ?? 0, "已消除", "muted"),
       statChip(s.total ?? 0, "累计发现", ""),
     ].join("");
     $("#queue-synced").textContent = data.synced_at
-      ? `已按当前链路重算 · ${data.synced_at}`
+      ? `租约 15 分钟 · 已按当前链路重算 · ${data.synced_at}`
       : "";
 
     // 经手人候选（跨样本去重，由服务端返回）
@@ -625,10 +640,42 @@
 
     const tbody = $("#queue-tbody");
     if (!data.items.length) {
-      tbody.innerHTML = `<tr><td colspan="8" class="muted-cell" style="text-align:center;padding:22px">当前筛选条件下没有审计发现</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="9" class="muted-cell" style="text-align:center;padding:22px">当前筛选条件下没有审计发现</td></tr>`;
       return;
     }
     tbody.innerHTML = data.items.map(renderQueueRow).join("");
+  }
+
+  function formatRemaining(seconds) {
+    if (seconds <= 0) return "已到期，可接管";
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `剩余 ${m} 分 ${String(s).padStart(2, "0")} 秒`;
+  }
+
+  function renderClaimCell(it) {
+    if (it.status !== "open") {
+      return `<span class="muted-cell">—</span>`;
+    }
+    if (it.claim_active) {
+      const mine = it.claimed_by === currentHandler();
+      const cls = mine ? "claim-mine" : "claim-active";
+      const label = mine ? "我已认领" : "认领中";
+      return `
+        <div class="${cls}" data-claim-cell="${it.fingerprint}" data-expires="${esc(
+        it.claim_expires_at
+      )}">
+          <span class="claim-label">${label} · ${esc(it.claimed_by)}</span>
+          <div class="claim-countdown" data-countdown="${it.fingerprint}">${formatRemaining(
+        it.remaining_seconds
+      )}</div>
+        </div>`;
+    }
+    if (it.last_claimed_by) {
+      return `<div class="claim-expired">已到期，可接管
+        <div class="muted-cell">原认领人 ${esc(it.last_claimed_by)}</div></div>`;
+    }
+    return `<span class="claim-unclaimed">未认领</span>`;
   }
 
   function renderQueueRow(it) {
@@ -651,11 +698,25 @@
             it.note ? `<div class="muted-cell">${esc(it.note)}</div>` : ""
           }<div class="muted-cell">${esc(it.resolved_at || it.updated_at || "")}</div>`
         : `<span class="muted-cell">—</span>`;
+    const me = currentHandler();
+    const mine = it.status === "open" && it.claim_active && it.claimed_by === me;
     const actions = [];
     if (it.status === "open") {
-      actions.push(
-        `<button class="link-btn btn-edit" data-dispose="resolve" data-fp="${it.fingerprint}" data-ver="${it.version}">处置</button>`
-      );
+      if (!it.claim_active) {
+        actions.push(
+          `<button class="link-btn btn-edit" data-claim="take" data-fp="${it.fingerprint}" data-ver="${it.version}">${
+            it.last_claimed_by ? "接管" : "认领"
+          }</button>`
+        );
+      } else if (mine) {
+        actions.push(
+          `<button class="link-btn btn-edit" data-dispose="resolve" data-fp="${it.fingerprint}" data-ver="${it.version}">处置</button>`
+        );
+        actions.push(
+          `<button class="link-btn btn-del" data-release="${it.fingerprint}" data-ver="${it.version}">释放</button>`
+        );
+      }
+      // 被他人有效认领期间不显示任何处置按钮
     } else if (it.status === "resolved") {
       actions.push(
         `<button class="link-btn btn-edit" data-dispose="reopen" data-fp="${it.fingerprint}" data-ver="${it.version}">重新打开</button>`
@@ -676,6 +737,7 @@
         <td>${it.custodians.map(esc).join("、") || "—"}</td>
         <td>${timeRange}</td>
         <td>${statusBadge}<div class="muted-cell">首次 ${esc(it.first_seen_at)}</div></td>
+        <td>${renderClaimCell(it)}</td>
         <td>${disposeInfo}</td>
         <td style="white-space:nowrap">${actions.join("")}</td>
       </tr>`;
@@ -690,19 +752,61 @@
       custodian: $("#q-custodian").value.trim(),
       time_from: $("#q-from").value,
       time_to: $("#q-to").value,
+      claim: $("#q-claim").value,
     };
     loadQueue();
   });
   $("#btn-queue-reset").addEventListener("click", () => {
     $("#queue-filter-form").reset();
     $("#q-status").value = "open";
-    state.queue.filters = { status: "open", code: "", custodian: "", time_from: "", time_to: "" };
+    state.queue.filters = {
+      status: "open", code: "", custodian: "", time_from: "", time_to: "", claim: "",
+    };
     loadQueue();
   });
   $("#btn-queue-refresh").addEventListener("click", loadQueue);
 
-  // 队列行操作：处置 / 重新打开 / 迁移记录
+  // 租约剩余时间本地倒计时：到期瞬间自动刷新队列，把「认领中」切换为「可接管」
+  setInterval(() => {
+    if (state.view !== "queue" || !state.queue.data) return;
+    let anyExpired = false;
+    document.querySelectorAll("[data-countdown]").forEach((el) => {
+      const fp = el.dataset.countdown;
+      const cell = el.closest("[data-claim-cell]");
+      if (!cell) return;
+      const expiresAt = new Date(cell.dataset.expires.replace(" ", "T")).getTime();
+      const remainSec = Math.max(
+        0,
+        Math.round((expiresAt - (Date.now() + state.queue.serverOffsetMs)) / 1000)
+      );
+      el.textContent = formatRemaining(remainSec);
+      if (remainSec === 0) anyExpired = true;
+      void fp;
+    });
+    if (anyExpired && !state.queue._expiredReloading) {
+      state.queue._expiredReloading = true;
+      loadQueue().finally(() => {
+        state.queue._expiredReloading = false;
+      });
+    }
+  }, 1000);
+
+  // 队列行操作：认领/接管 / 释放 / 处置 / 重新打开 / 迁移记录
   $("#queue-tbody").addEventListener("click", (e) => {
+    const claimBtn = e.target.closest("button[data-claim]");
+    if (claimBtn) {
+      openClaimModal(
+        claimBtn.dataset.fp,
+        Number(claimBtn.dataset.ver),
+        claimBtn.dataset.claim === "take"
+      );
+      return;
+    }
+    const releaseBtn = e.target.closest("button[data-release]");
+    if (releaseBtn) {
+      doRelease(releaseBtn.dataset.release, Number(releaseBtn.dataset.ver));
+      return;
+    }
     const disposeBtn = e.target.closest("button[data-dispose]");
     if (disposeBtn) {
       openDisposeModal(
@@ -715,6 +819,98 @@
     const histBtn = e.target.closest("button[data-history]");
     if (histBtn) openFindingHistory(histBtn.dataset.history);
   });
+
+  function findQueueItem(fp) {
+    const items = (state.queue.data && state.queue.data.items) || [];
+    return items.find((x) => x.fingerprint === fp);
+  }
+
+  function openClaimModal(fp, version, canTakeOver) {
+    const it = findQueueItem(fp);
+    if (!it) return;
+    state.queue.claim = { fp, version };
+    const takingOver = !!(it.last_claimed_by && !it.claim_active);
+    $("#claim-title").textContent = takingOver ? "接管审计发现（原租约已到期）" : "限时认领审计发现";
+    $("#cp-submit").textContent = takingOver ? "接管（锁定 15 分钟）" : "认领（锁定 15 分钟）";
+    $("#claim-body").innerHTML = `
+      <div class="dispose-finding">
+        <div><span class="meta-lbl">样本</span>${esc(it.sample.code)} · ${esc(it.sample.name)}</div>
+        <div><span class="meta-lbl">类型</span>${esc(FINDING_LABEL[it.code] || it.code)}</div>
+        <div><span class="meta-lbl">发现</span>${esc(it.message)}</div>
+        <div><span class="meta-lbl">指纹版本</span><code class="digest">${esc(
+          it.fingerprint.slice(0, 12)
+        )}</code> · v${it.version}</div>
+        ${
+          takingOver
+            ? `<div><span class="meta-lbl">原认领人</span>${esc(
+                it.last_claimed_by
+              )}（租约已到期）</div>`
+            : ""
+        }
+      </div>
+      <p class="muted-cell ho-modal-hint">认领后该发现锁定 15 分钟，仅你可以标记已处理或主动释放；期间其他人提交认领将收到 409 冲突，租约到期后可被接管（版本递增）。</p>`;
+    $("#claim-form").reset();
+    $("#cp-handler").value = currentHandler();
+    $("#claim-modal").hidden = false;
+    $("#cp-handler").focus();
+    void canTakeOver;
+  }
+
+  const claimModal = $("#claim-modal");
+  $("#btn-close-claim").addEventListener("click", () => (claimModal.hidden = true));
+  claimModal.addEventListener("click", (e) => {
+    if (e.target === claimModal) claimModal.hidden = true;
+  });
+
+  $("#claim-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const c = state.queue.claim;
+    if (!c) return;
+    const handler = $("#cp-handler").value.trim();
+    if (!handler) {
+      toast("请填写认领人", true);
+      return;
+    }
+    try {
+      const result = await api(`/api/findings/${c.fp}/claim`, {
+        method: "POST",
+        body: JSON.stringify({ expected_version: c.version, handler }),
+      });
+      rememberHandler(handler);
+      claimModal.hidden = true;
+      state.queue.claim = null;
+      toast(`认领成功，租约至 ${result.claim_expires_at}`);
+      await loadQueue();
+    } catch (err) {
+      if (err.status === 409 || err.status === 404) {
+        claimModal.hidden = true;
+        state.queue.claim = null;
+        await loadQueue();
+      }
+      toast(err.message, true);
+    }
+  });
+
+  async function doRelease(fp, version) {
+    const it = findQueueItem(fp);
+    if (!it) return;
+    const handler = it.claimed_by;
+    if (
+      !confirm(`确定主动释放对该发现的认领？释放后其他人可立即认领。\n（认领人：${handler}）`)
+    )
+      return;
+    try {
+      await api(`/api/findings/${fp}/release`, {
+        method: "POST",
+        body: JSON.stringify({ expected_version: version, handler }),
+      });
+      toast("已主动释放认领");
+      await loadQueue();
+    } catch (err) {
+      if (err.status === 409 || err.status === 404) await loadQueue();
+      toast(err.message, true);
+    }
+  }
 
   function openDisposeModal(fp, version, action) {
     const items = (state.queue.data && state.queue.data.items) || [];
@@ -732,11 +928,24 @@
           it.fingerprint.slice(0, 12)
         )}</code> · v${it.version}</div>
       </div>
-      <p class="muted-cell ho-modal-hint">提交时服务端将校验该指纹版本；若期间链路或状态已变化，将返回冲突并自动刷新队列。</p>`;
+      <p class="muted-cell ho-modal-hint">${
+        action === "resolve"
+          ? it.claim_active
+            ? `当前认领人：<b>${esc(
+                it.claimed_by
+              )}</b>，仅当前认领人可标记已处理；提交时同时校验指纹版本与认领租约，冲突时自动刷新队列。`
+            : "该发现未被有效认领，请先认领后再处置。"
+          : "提交时服务端将校验该指纹版本；若期间链路或状态已变化，将返回冲突并自动刷新队列。"
+      }</p>`;
     $("#dp-submit").textContent = action === "resolve" ? "标记已处理" : "重新打开";
     $("#dispose-form").reset();
+    // 未处理项只有当前认领人可处置，处置人即认领人（默认填入）
+    $("#dp-handler").value =
+      action === "resolve" && it.claim_active
+        ? it.claimed_by || currentHandler()
+        : currentHandler();
     $("#dispose-modal").hidden = false;
-    $("#dp-handler").focus();
+    $("#dp-note").focus();
   }
 
   const disposeModal = $("#dispose-modal");
@@ -764,6 +973,7 @@
         method: "POST",
         body: JSON.stringify(payload),
       });
+      rememberHandler(payload.handler);
       disposeModal.hidden = true;
       state.queue.dispose = null;
       toast(d.action === "resolve" ? "已标记为已处理" : "已重新打开，恢复为未处理");
@@ -782,17 +992,25 @@
   });
 
   // 状态迁移记录
+  const LEASE_EVENT_LABEL = { claim: "限时认领", release: "主动释放", takeover: "到期接管" };
+
   async function openFindingHistory(fp) {
     try {
       const d = await api(`/api/findings/${fp}`);
       const rows = (d.transitions || [])
         .map((t) => {
-          const move = t.from_status
-            ? `${FINDING_STATUS_LABEL[t.from_status] || t.from_status} → ${
-                FINDING_STATUS_LABEL[t.to_status] || t.to_status
-              }`
-            : `首次出现（${FINDING_STATUS_LABEL[t.to_status] || t.to_status}）`;
-          return `<tr>
+          let move;
+          if (t.event && LEASE_EVENT_LABEL[t.event]) {
+            move = `🔒 ${LEASE_EVENT_LABEL[t.event]}`;
+          } else if (t.from_status) {
+            move = `${FINDING_STATUS_LABEL[t.from_status] || t.from_status} → ${
+              FINDING_STATUS_LABEL[t.to_status] || t.to_status
+            }`;
+          } else {
+            move = `首次出现（${FINDING_STATUS_LABEL[t.to_status] || t.to_status}）`;
+          }
+          const rowCls = t.event && LEASE_EVENT_LABEL[t.event] ? "row-lease" : "";
+          return `<tr class="${rowCls}">
             <td>${esc(t.created_at)}</td>
             <td>${esc(move)}</td>
             <td>${t.handler ? esc(t.handler) : '<span class="muted-cell">系统</span>'}</td>
@@ -800,6 +1018,15 @@
           </tr>`;
         })
         .join("");
+      const leaseInfo = d.claim_active
+        ? `<div><span class="meta-lbl">当前认领</span>${esc(d.claimed_by)} · 至 ${esc(
+            d.claim_expires_at
+          )}（剩余 ${d.remaining_seconds} 秒）</div>`
+        : d.last_claimed_by
+        ? `<div><span class="meta-lbl">认领情况</span>租约已到期（原认领人 ${esc(
+            d.last_claimed_by
+          )}），可接管</div>`
+        : `<div><span class="meta-lbl">认领情况</span>未认领</div>`;
       $("#finding-history-body").innerHTML = `
         <div class="signoff-meta">
           <div><span class="meta-lbl">样本</span>${esc(d.sample.code)} · ${esc(d.sample.name)}</div>
@@ -807,6 +1034,7 @@
           <div><span class="meta-lbl">当前状态</span>${esc(
             FINDING_STATUS_LABEL[d.status] || d.status
           )}（v${d.version}）</div>
+          ${d.status === "open" ? leaseInfo : ""}
           <div><span class="meta-lbl">稳定指纹</span><code class="digest">${esc(d.fingerprint)}</code></div>
           <div><span class="meta-lbl">首次出现</span>${esc(d.first_seen_at)}</div>
           <div><span class="meta-lbl">最近出现</span>${esc(d.last_seen_at)}</div>
@@ -814,7 +1042,7 @@
         <p class="conclusion">${esc(d.message)}</p>
         <div class="table-wrap">
           <table class="event-table">
-            <thead><tr><th>时间</th><th>状态迁移</th><th>操作人</th><th>备注</th></tr></thead>
+            <thead><tr><th>时间</th><th>状态迁移 / 认领事件</th><th>操作人</th><th>备注</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>`;

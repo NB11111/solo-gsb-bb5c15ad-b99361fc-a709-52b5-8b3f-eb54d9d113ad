@@ -152,6 +152,7 @@ class FindingDispose(BaseModel):
 
     必须携带客户端看到的指纹版本号 ``expected_version``（乐观锁）；
     版本过期时服务端返回 409，客户端应刷新队列后重试。
+    标记已处理仅允许该发现的**当前限时认领人**操作（``handler`` 须与认领人一致）。
     """
 
     action: str = Field(..., pattern="^(resolve|reopen)$")
@@ -171,3 +172,37 @@ class FindingDispose(BaseModel):
     @classmethod
     def _strip_note(cls, v: str) -> str:
         return v.strip()
+
+
+class FindingClaim(BaseModel):
+    """限时认领 / 到期接管：租约 15 分钟。
+
+    必须携带客户端看到的指纹版本号 ``expected_version``；租约未到期且认领人
+    不是本人时服务端返回 409。
+    """
+
+    expected_version: int = Field(..., ge=1)
+    handler: str = Field(..., min_length=1, max_length=64)
+
+    @field_validator("handler")
+    @classmethod
+    def _strip_handler(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("认领人不能为空")
+        return v
+
+
+class FindingRelease(BaseModel):
+    """主动释放认领租约：只有当前认领人可释放，同样校验指纹版本。"""
+
+    expected_version: int = Field(..., ge=1)
+    handler: str = Field(..., min_length=1, max_length=64)
+
+    @field_validator("handler")
+    @classmethod
+    def _strip_handler(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("处置人不能为空")
+        return v

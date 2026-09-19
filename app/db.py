@@ -114,39 +114,47 @@ CREATE INDEX IF NOT EXISTS idx_handovers_pair
 -- 异常处置队列：跨样本的审计发现处置状态。发现身份为 SHA-256 稳定指纹
 -- （样本 + 关联事件 + 异常类型 + 时间边界），与列表顺序无关；
 -- 链路变更后重算：仍存在沿用状态、消失转已消除、新出现未处理。
--- version 为乐观锁：处置写入必须携带客户端看到的版本，过期返回 409。
+-- version 为乐观锁：认领 / 处置写入必须携带客户端看到的版本，过期返回 409。
+-- 限时认领：claimed_by 为当前认领人、claim_expires_at 为租约到期时间；
+-- 租约 15 分钟到期后其他人可接管（版本递增），仅当前认领人可处置 / 释放。
 CREATE TABLE IF NOT EXISTS findings (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint   TEXT    NOT NULL UNIQUE,
-    sample_id     INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
-    code          TEXT    NOT NULL,
-    kind          TEXT    NOT NULL,
-    message       TEXT    NOT NULL,
-    event_ids     TEXT    NOT NULL DEFAULT '[]',
-    custodians    TEXT    NOT NULL DEFAULT '[]',
-    time_from     TEXT,
-    time_to       TEXT,
-    status        TEXT    NOT NULL DEFAULT 'open',
-    handler       TEXT,
-    note          TEXT    NOT NULL DEFAULT '',
-    version       INTEGER NOT NULL DEFAULT 1,
-    first_seen_at TEXT    NOT NULL,
-    last_seen_at  TEXT    NOT NULL,
-    resolved_at   TEXT,
-    eliminated_at TEXT,
-    created_at    TEXT    NOT NULL,
-    updated_at    TEXT    NOT NULL
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint       TEXT    NOT NULL UNIQUE,
+    sample_id         INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    code              TEXT    NOT NULL,
+    kind              TEXT    NOT NULL,
+    message           TEXT    NOT NULL,
+    event_ids         TEXT    NOT NULL DEFAULT '[]',
+    custodians        TEXT    NOT NULL DEFAULT '[]',
+    time_from         TEXT,
+    time_to           TEXT,
+    status            TEXT    NOT NULL DEFAULT 'open',
+    handler           TEXT,
+    note              TEXT    NOT NULL DEFAULT '',
+    version           INTEGER NOT NULL DEFAULT 1,
+    claimed_by        TEXT,
+    claim_expires_at  TEXT,
+    claimed_at        TEXT,
+    first_seen_at     TEXT    NOT NULL,
+    last_seen_at      TEXT    NOT NULL,
+    resolved_at       TEXT,
+    eliminated_at     TEXT,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_sample ON findings(sample_id);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
 
--- 状态迁移记录：首次出现、人工处置与系统自动迁移（消除 / 复现）全部留痕
+-- 状态迁移记录：首次出现、人工处置与系统自动迁移（消除 / 复现）全部留痕。
+-- event 区分记录类型：status_change（处置状态迁移，默认）、
+-- claim（限时认领）/ release（主动释放）/ takeover（到期接管）。
 CREATE TABLE IF NOT EXISTS finding_transitions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     finding_id  INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
     from_status TEXT,
     to_status   TEXT    NOT NULL,
+    event       TEXT    NOT NULL DEFAULT 'status_change',
     handler     TEXT,
     note        TEXT    NOT NULL DEFAULT '',
     created_at  TEXT    NOT NULL
@@ -156,10 +164,32 @@ CREATE INDEX IF NOT EXISTS idx_ftrans_finding ON finding_transitions(finding_id)
 """
 
 
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """对已存在的旧库做增量列迁移（CREATE TABLE IF NOT EXISTS 不会补列）。
+
+    限时认领特性引入 findings 的三个租约列与 finding_transitions.event 列。
+    """
+    finding_cols = {r["name"] for r in conn.execute("PRAGMA table_info(findings)")}
+    for col, decl in (
+        ("claimed_by", "TEXT"),
+        ("claim_expires_at", "TEXT"),
+        ("claimed_at", "TEXT"),
+    ):
+        if col not in finding_cols:
+            conn.execute(f"ALTER TABLE findings ADD COLUMN {col} {decl}")
+
+    trans_cols = {r["name"] for r in conn.execute("PRAGMA table_info(finding_transitions)")}
+    if "event" not in trans_cols:
+        conn.execute(
+            "ALTER TABLE finding_transitions ADD COLUMN event TEXT NOT NULL DEFAULT 'status_change'"
+        )
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA)
+        _migrate_schema(conn)
         _seed_demo_data(conn)
 
 

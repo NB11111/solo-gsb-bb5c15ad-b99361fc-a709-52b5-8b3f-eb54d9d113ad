@@ -518,8 +518,24 @@ tr.row-invalid { background: #fffdf5; }
   padding: 1px 7px; border-radius: 999px;
 }
 
-.form-grid-queue { grid-template-columns: repeat(5, 1fr); }
+.form-grid-queue { grid-template-columns: repeat(6, 1fr); }
 .queue-synced { margin-left: auto; align-self: center; }
+
+/* 限时认领单元格 */
+.claim-unclaimed {
+  font-size: 12.5px; color: var(--muted);
+}
+.claim-active, .claim-mine {
+  font-size: 12.5px; padding: 4px 8px; border-radius: 6px; white-space: nowrap;
+}
+.claim-active { background: var(--warn-bg); color: var(--warn-text); border: 1px solid #f3d9a0; }
+.claim-mine { background: var(--ok-bg); color: var(--ok-text); border: 1px solid #b7e4c7; }
+.claim-label { font-weight: 700; }
+.claim-countdown { font-variant-numeric: tabular-nums; margin-top: 2px; }
+.claim-expired {
+  font-size: 12.5px; color: var(--danger); font-weight: 600; white-space: nowrap;
+}
+tr.row-lease { background: #f8fafc; }
 
 .finding-tag {
   display: inline-block; font-size: 11.5px; font-weight: 600;
