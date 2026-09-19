@@ -17,12 +17,30 @@
 处置写入（标记已处理 / 重新打开）必须携带客户端看到的指纹版本号
 ``expected_version``：版本不一致说明期间状态已被他人更新或链路已变化，
 返回 409 冲突，客户端应刷新队列后重试。
+
+限时认领
+========
+未处理发现可由处置人认领，租约固定 **15 分钟**（``CLAIM_TTL_SECONDS``，
+可用环境变量覆盖）。认领 / 接管在单一事务（``BEGIN IMMEDIATE``）内执行：
+先按当前链路重算发现指纹，再以一条条件 UPDATE **同时** 校验
+``expected_version`` 与租约状态——
+
+* 租约未到期且认领人是别人 -> 409；
+* 租约到期（或从未认领 / 已释放）-> 接管成功，写入新认领人、新的到期时间，
+  版本号 +1，迁移记录区分「认领 claim」与「过期接管 takeover」。
+
+只有当前认领人可以标记已处理或主动释放（``release``，版本 +1）；
+异常被系统消除（或已处理）时租约随之失效，同一指纹复现后保持**未认领**。
+队列支持按认领状态（``unclaimed`` / ``claimed`` / ``expired``）筛选，
+每条未处理发现返回剩余租约秒数与到期时间。
 """
 from __future__ import annotations
 
 import hashlib
 import json
-from datetime import datetime
+import os
+from contextlib import contextmanager
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from sqlite3 import Connection
 
@@ -42,6 +60,47 @@ STATUS_TEXT = {
 # 处置动作
 ACTION_RESOLVE = "resolve"
 ACTION_REOPEN = "reopen"
+ACTION_CLAIM = "claim"
+ACTION_RELEASE = "release"
+
+# 迁移事件（finding_transitions.event）
+EVENT_STATE = "state"        # 普通处置状态迁移（首次出现 / 已处理 / 重新打开 / 消除 / 复现）
+EVENT_CLAIM = "claim"        # 限时认领
+EVENT_RELEASE = "release"    # 当前认领人主动释放
+EVENT_TAKEOVER = "takeover"  # 租约到期后他人接管
+EVENT_LEASE_VOID = "lease_void"  # 租约因系统消除 / 人工处置而失效（附加留痕）
+
+EVENT_TEXT = {
+    EVENT_STATE: "状态迁移",
+    EVENT_CLAIM: "限时认领",
+    EVENT_RELEASE: "主动释放",
+    EVENT_TAKEOVER: "过期接管",
+    EVENT_LEASE_VOID: "租约失效",
+}
+
+# 认领状态（视图派生值，不入库）
+CLAIM_UNCLAIMED = "unclaimed"
+CLAIM_CLAIMED = "claimed"
+CLAIM_EXPIRED = "expired"
+
+CLAIM_STATUS_TEXT = {
+    CLAIM_UNCLAIMED: "未认领",
+    CLAIM_CLAIMED: "认领中",
+    CLAIM_EXPIRED: "已过期",
+}
+
+
+def claim_ttl_seconds() -> int:
+    """单次认领租约时长（秒），默认 15 分钟，可用环境变量覆盖。"""
+    raw = os.environ.get("FINDING_CLAIM_TTL_SECONDS", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return 15 * 60
 
 
 class FindingError(Exception):
@@ -55,6 +114,28 @@ class FindingError(Exception):
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_stored(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S")
+
+
+@contextmanager
+def _write_transaction(conn: Connection):
+    """立即获取写锁的单一事务（与批量导入确认一致的并发策略）。
+
+    请求级连接此时尚未开启事务；先 ``BEGIN IMMEDIATE`` 抢写锁，
+    保证「重算指纹 -> 条件 UPDATE」之间不会插入他人的写入。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
 
 
 # ---------- 稳定指纹 ----------
@@ -131,11 +212,21 @@ def _record_transition(
     handler: Optional[str],
     note: str,
     now: str,
+    event: str = EVENT_STATE,
 ) -> None:
     conn.execute(
         "INSERT INTO finding_transitions (finding_id, from_status, to_status, "
-        "handler, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (finding_id, from_status, to_status, handler, note, now),
+        "event, handler, note, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (finding_id, from_status, to_status, event, handler, note, now),
+    )
+
+
+def _clear_lease(conn: Connection, finding_id: int) -> None:
+    """清除认领租约三列（系统消除 / 复现 / 已处理 / 重新打开时调用）。"""
+    conn.execute(
+        "UPDATE findings SET claimed_by = NULL, claimed_at = NULL, "
+        "claim_expires_at = NULL WHERE id = ?",
+        (finding_id,),
     )
 
 
@@ -210,10 +301,12 @@ def sync_sample_findings(
             ).fetchone()
 
         if row["status"] == ELIMINATED:
-            # 同一指纹的异常复现：恢复原记录为未处理，历史迁移留痕
+            # 同一指纹的异常复现：恢复原记录为未处理，历史迁移留痕。
+            # 消除时租约已失效，复现后保持未认领。
             conn.execute(
                 "UPDATE findings SET status = ?, message = ?, event_ids = ?, "
                 "custodians = ?, time_from = ?, time_to = ?, eliminated_at = NULL, "
+                "claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL, "
                 "last_seen_at = ?, version = version + 1, updated_at = ? WHERE id = ?",
                 (
                     OPEN, info["message"], event_ids_json, custodians_json,
@@ -250,6 +343,18 @@ def sync_sample_findings(
             conn, row["id"], row["status"], ELIMINATED, None,
             "链路变更后该异常不再出现，转为已消除", now,
         )
+        # 异常被系统消除时，未到期的限时认领租约自动失效（附加留痕），
+        # 复现后保持未认领
+        if row["claimed_by"] and row["claim_expires_at"] and row["claim_expires_at"] > now:
+            _clear_lease(conn, row["id"])
+            _record_transition(
+                conn, row["id"], ELIMINATED, ELIMINATED, row["claimed_by"],
+                "异常随链路变更消除，限时认领租约自动失效", now,
+                event=EVENT_LEASE_VOID,
+            )
+        elif row["claimed_by"]:
+            # 租约本已到期：同样清空列，保持「复现后未认领」语义
+            _clear_lease(conn, row["id"])
         stats["eliminated"] += 1
     return stats
 
@@ -263,7 +368,39 @@ def sync_all_findings(conn: Connection) -> None:
 
 # ---------- 视图 ----------
 
-def _finding_dict(row: Any) -> dict[str, Any]:
+def claim_state(row: Any, now: Optional[datetime] = None) -> Optional[str]:
+    """派生认领状态。
+
+    未处理发现：``unclaimed`` 未认领 / ``claimed`` 认领中（租约未到期）/
+    ``expired`` 已到期可接管；已处理 / 已消除发现的租约列在状态迁移时即被
+    清空，返回 None。
+    """
+    if row["status"] != OPEN:
+        return None
+    if not row["claimed_by"] or not row["claim_expires_at"]:
+        return CLAIM_UNCLAIMED
+    moment = now or datetime.now()
+    expires = _parse_stored(row["claim_expires_at"])
+    if expires is not None and expires > moment:
+        return CLAIM_CLAIMED
+    return CLAIM_EXPIRED
+
+
+def claim_remaining_seconds(row: Any, now: Optional[datetime] = None) -> Optional[int]:
+    """剩余认领秒数：认领中返回剩余值；未认领 / 已到期为 0；非未处理为 None。"""
+    state = claim_state(row, now)
+    if state is None:
+        return None
+    if state != CLAIM_CLAIMED:
+        return 0
+    moment = now or datetime.now()
+    expires = _parse_stored(row["claim_expires_at"])
+    return max(0, int((expires - moment).total_seconds())) if expires else 0
+
+
+def _finding_dict(row: Any, now: Optional[datetime] = None) -> dict[str, Any]:
+    claim = claim_state(row, now)
+    remaining = claim_remaining_seconds(row, now)
     return {
         "fingerprint": row["fingerprint"],
         "version": row["version"],
@@ -283,6 +420,13 @@ def _finding_dict(row: Any) -> dict[str, Any]:
         "status_text": STATUS_TEXT.get(row["status"], row["status"]),
         "handler": row["handler"],
         "note": row["note"],
+        "claimed_by": row["claimed_by"],
+        "claimed_at": row["claimed_at"],
+        "claim_expires_at": row["claim_expires_at"],
+        "claim_state": claim,
+        "claim_state_text": CLAIM_STATUS_TEXT.get(claim) if claim else None,
+        "claim_remaining_seconds": remaining,
+        "claim_ttl_seconds": claim_ttl_seconds(),
         "first_seen_at": row["first_seen_at"],
         "last_seen_at": row["last_seen_at"],
         "resolved_at": row["resolved_at"],
@@ -292,13 +436,23 @@ def _finding_dict(row: Any) -> dict[str, Any]:
 
 
 def queue_summary(conn: Connection) -> dict[str, int]:
-    """未处理 / 已处理 / 已消除 / 累计数量（全局，不受筛选影响）。"""
+    """未处理 / 已处理 / 已消除 / 累计数量（全局，不受筛选影响）。
+
+    ``claimed`` 为当前租约未到期（剩余时间 > 0）的未处理发现数。
+    """
     counts = {OPEN: 0, RESOLVED: 0, ELIMINATED: 0}
     for r in conn.execute("SELECT status, COUNT(*) AS n FROM findings GROUP BY status"):
         if r["status"] in counts:
             counts[r["status"]] = r["n"]
+    now = _now()
+    claimed = conn.execute(
+        "SELECT COUNT(*) AS n FROM findings WHERE status = ? AND claimed_by IS NOT NULL "
+        "AND claim_expires_at IS NOT NULL AND claim_expires_at > ?",
+        (OPEN, now),
+    ).fetchone()["n"]
     return {
         "open": counts[OPEN],
+        "claimed": claimed,
         "resolved": counts[RESOLVED],
         "eliminated": counts[ELIMINATED],
         "total": sum(counts.values()),
@@ -325,10 +479,18 @@ def build_queue(
     custodian: Optional[str] = None,
     time_from: Optional[str] = None,
     time_to: Optional[str] = None,
+    claim: Optional[str] = None,
 ) -> dict[str, Any]:
-    """跨样本异常处置队列：先重算指纹，再按状态 / 异常类型 / 经手人 / 发生时间筛选。"""
+    """跨样本异常处置队列：先重算指纹，再按状态 / 异常类型 / 经手人 / 发生时间 /
+    认领状态筛选。
+
+    ``claim`` 仅对未处理发现有意义：``unclaimed`` 未认领、``claimed`` 认领中
+    （租约未到期）、``expired`` 已过期可接管。
+    """
     sync_all_findings(conn)
     summary = queue_summary(conn)
+    now_dt = datetime.now()
+    now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
 
     sql = (
         "SELECT f.*, s.code AS sample_code, s.name AS sample_name "
@@ -342,6 +504,21 @@ def build_queue(
     if code:
         clauses.append("f.code = ?")
         params.append(code)
+    # 认领状态筛选在 SQL 层收窄（到期判定用存储文本与当前时间比较）
+    if claim == CLAIM_UNCLAIMED:
+        clauses.append(
+            "(f.status <> ? OR f.claimed_by IS NULL OR f.claim_expires_at IS NULL)"
+        )
+        params.append(OPEN)
+    elif claim == CLAIM_CLAIMED:
+        clauses.append("f.status = ? AND f.claimed_by IS NOT NULL AND f.claim_expires_at > ?")
+        params.extend((OPEN, now))
+    elif claim == CLAIM_EXPIRED:
+        clauses.append(
+            "f.status = ? AND f.claimed_by IS NOT NULL AND "
+            "f.claim_expires_at IS NOT NULL AND f.claim_expires_at <= ?"
+        )
+        params.extend((OPEN, now))
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY f.last_seen_at DESC, f.id DESC"
@@ -349,7 +526,12 @@ def build_queue(
     custodian_q = (custodian or "").strip()
     items: list[dict[str, Any]] = []
     for r in conn.execute(sql, params).fetchall():
-        item = _finding_dict(r)
+        item = _finding_dict(r, now=now_dt)
+        # claim=unclaimed 对非未处理发现天然放行（无租约），此处再按语义收窄：
+        # 认领筛选只作用于未处理发现
+        if claim in (CLAIM_UNCLAIMED, CLAIM_CLAIMED, CLAIM_EXPIRED):
+            if item["status"] != OPEN or item["claim_state"] != claim:
+                continue
         if custodian_q and not any(custodian_q in c for c in item["custodians"]):
             continue
         # 发生时间筛选：发现的时间边界与筛选区间相交才保留（开放结束视为无限远）
@@ -374,9 +556,11 @@ def build_queue(
             "custodian": custodian_q,
             "time_from": time_from,
             "time_to": time_to,
+            "claim": claim,
         },
         "custodians": custodians,
-        "synced_at": _now(),
+        "claim_ttl_seconds": claim_ttl_seconds(),
+        "synced_at": now,
     }
 
 
@@ -402,6 +586,11 @@ def get_finding_detail(conn: Connection, fingerprint: str) -> dict[str, Any]:
             "from_status_text": STATUS_TEXT.get(t["from_status"]) if t["from_status"] else None,
             "to_status": t["to_status"],
             "to_status_text": STATUS_TEXT.get(t["to_status"], t["to_status"]),
+            "event": t["event"] if "event" in t.keys() else EVENT_STATE,
+            "event_text": EVENT_TEXT.get(
+                t["event"] if "event" in t.keys() else EVENT_STATE,
+                EVENT_TEXT[EVENT_STATE],
+            ),
             "handler": t["handler"],
             "note": t["note"],
             "created_at": t["created_at"],
@@ -416,6 +605,162 @@ def get_finding_detail(conn: Connection, fingerprint: str) -> dict[str, Any]:
     return detail
 
 
+# ---------- 限时认领（租约） ----------
+
+def _fetch_finding_for_write(conn: Connection, fingerprint: str) -> Any:
+    """取发现行；不存在（可能样本已删除）返回 404。"""
+    row = conn.execute(
+        "SELECT * FROM findings WHERE fingerprint = ?", (fingerprint,)
+    ).fetchone()
+    if row is None:
+        raise FindingError("该审计发现不存在（可能样本已删除），请刷新队列", status_code=404)
+    return row
+
+
+def _check_version(row: Any, expected_version: int) -> None:
+    if row["version"] != expected_version:
+        raise FindingError(
+            "该发现已被其他人处置或链路已变化（指纹版本过期），请刷新队列后重试",
+            status_code=409,
+        )
+
+
+def claim_finding(
+    conn: Connection,
+    fingerprint: str,
+    handler: str,
+    expected_version: int,
+) -> dict[str, Any]:
+    """限时认领 / 过期接管（固定 15 分钟租约）。
+
+    在单一写事务（``BEGIN IMMEDIATE``）内：先按当前链路重算该样本的发现指纹，
+    再以一条条件 UPDATE **同时** 校验客户端版本与租约状态——
+
+    * 租约未到期且属于别人：条件不命中 -> 409；
+    * 自己已持有未到期租约：幂等返回（不递增版本、不续期）；
+    * 无租约 / 已释放 / 已到期：认领或接管成功，版本 +1，
+      迁移记录按「认领 claim / 过期接管 takeover」区分。
+    """
+    with _write_transaction(conn):
+        row = _fetch_finding_for_write(conn, fingerprint)
+        sample_id = row["sample_id"]
+        sync_sample_findings(conn, sample_id)
+        row = _fetch_finding_for_write(conn, fingerprint)
+        _check_version(row, expected_version)
+
+        if row["status"] != OPEN:
+            text = (
+                "该发现已处理，无需认领"
+                if row["status"] == RESOLVED
+                else "该异常已随链路变更消除，不能认领"
+            )
+            raise FindingError(text, status_code=409)
+
+        now_dt = datetime.now()
+        now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        active = claim_state(row, now_dt) == CLAIM_CLAIMED
+
+        if active and row["claimed_by"] == handler:
+            # 同一认领人重复认领：幂等成功，不续期、不递增版本
+            detail = get_finding_detail(conn, fingerprint)
+            sync_all_findings(conn)
+            detail["summary"] = queue_summary(conn)
+            return detail
+
+        if active:
+            raise FindingError(
+                f"该发现已由 {row['claimed_by']} 认领（租约至 {row['claim_expires_at']} 到期），"
+                "到期前不可重复认领",
+                status_code=409,
+            )
+
+        takeover = row["claimed_by"] is not None  # 租约已到期（字段残留）-> 接管
+        previous_owner = row["claimed_by"]
+        expires_dt = now_dt + timedelta(seconds=claim_ttl_seconds())
+        expires_at = expires_dt.strftime("%Y-%m-%d %H:%M:%S")
+        # 条件 UPDATE：版本 + 租约状态同时原子校验。
+        # 未到期且属于他人时 claim_expires_at > now，整条 WHERE 不命中 -> 409。
+        cur = conn.execute(
+            "UPDATE findings SET claimed_by = ?, claimed_at = ?, claim_expires_at = ?, "
+            "version = version + 1, updated_at = ? "
+            "WHERE id = ? AND version = ? AND status = ? AND "
+            "(claimed_by IS NULL OR claimed_by = ? OR claim_expires_at <= ?)",
+            (handler, now, expires_at, now, row["id"], expected_version, OPEN,
+             handler, now),
+        )
+        if not cur.rowcount:
+            raise FindingError(
+                "该发现刚被其他人认领或状态已变化，请刷新队列后重试",
+                status_code=409,
+            )
+        if takeover:
+            note = f"{previous_owner} 的认领租约到期，{handler} 接管（新租约至 {expires_at}）"
+            _record_transition(
+                conn, row["id"], OPEN, OPEN, handler, note, now, event=EVENT_TAKEOVER
+            )
+        else:
+            note = f"认领处置，租约 15 分钟，至 {expires_at} 到期"
+            _record_transition(
+                conn, row["id"], OPEN, OPEN, handler, note, now, event=EVENT_CLAIM
+            )
+        detail = get_finding_detail(conn, fingerprint)
+        sync_all_findings(conn)
+        detail["summary"] = queue_summary(conn)
+        return detail
+
+
+def release_finding(
+    conn: Connection,
+    fingerprint: str,
+    handler: str,
+    expected_version: int,
+    note: str = "",
+) -> dict[str, Any]:
+    """当前认领人主动释放未到期租约（版本 +1）。
+
+    非认领人、租约已到期（应直接接管而非释放）、版本过期均返回 409。
+    """
+    with _write_transaction(conn):
+        row = _fetch_finding_for_write(conn, fingerprint)
+        sync_sample_findings(conn, row["sample_id"])
+        row = _fetch_finding_for_write(conn, fingerprint)
+        _check_version(row, expected_version)
+
+        if row["status"] != OPEN:
+            raise FindingError("该发现当前不是未处理状态，无需释放认领", status_code=409)
+        now_dt = datetime.now()
+        now = now_dt.strftime("%Y-%m-%d %H:%M:%S")
+        if not row["claimed_by"]:
+            raise FindingError("该发现尚未被认领，无需释放", status_code=409)
+        if claim_state(row, now_dt) != CLAIM_CLAIMED:
+            raise FindingError(
+                f"认领租约已到期（{row['claimed_by']}），可直接接管，无需释放",
+                status_code=409,
+            )
+        if row["claimed_by"] != handler:
+            raise FindingError(
+                f"只有当前认领人（{row['claimed_by']}）可以主动释放",
+                status_code=409,
+            )
+
+        cur = conn.execute(
+            "UPDATE findings SET claimed_by = NULL, claimed_at = NULL, "
+            "claim_expires_at = NULL, version = version + 1, updated_at = ? "
+            "WHERE id = ? AND version = ? AND status = ? AND claimed_by = ?",
+            (now, row["id"], expected_version, OPEN, handler),
+        )
+        if not cur.rowcount:
+            raise FindingError("该发现认领状态已变化，请刷新队列后重试", status_code=409)
+        _record_transition(
+            conn, row["id"], OPEN, OPEN, handler, note or "主动释放认领", now,
+            event=EVENT_RELEASE,
+        )
+        detail = get_finding_detail(conn, fingerprint)
+        sync_all_findings(conn)
+        detail["summary"] = queue_summary(conn)
+        return detail
+
+
 # ---------- 处置写入（指纹版本乐观锁） ----------
 
 def dispose_finding(
@@ -428,65 +773,75 @@ def dispose_finding(
 ) -> dict[str, Any]:
     """标记已处理 / 重新打开。
 
-    先按当前链路重算指纹（若异常已消失或复现，版本号会随之变化），再校验
-    客户端看到的指纹版本；版本过期或状态不允许均返回 409，客户端应刷新队列。
+    先在单一写事务内按当前链路重算指纹（若异常已消失或复现，版本号会随之变化），
+    再校验客户端版本与租约状态；版本过期、状态不允许或非当前认领人尝试标记
+    已处理均返回 409，客户端应刷新队列。
     """
-    row = conn.execute(
-        "SELECT * FROM findings WHERE fingerprint = ?", (fingerprint,)
-    ).fetchone()
-    if row is None:
-        raise FindingError("该审计发现不存在（可能样本已删除），请刷新队列", status_code=404)
+    with _write_transaction(conn):
+        row = _fetch_finding_for_write(conn, fingerprint)
+        sync_sample_findings(conn, row["sample_id"])
+        row = _fetch_finding_for_write(conn, fingerprint)
 
-    sync_sample_findings(conn, row["sample_id"])
-    row = conn.execute(
-        "SELECT * FROM findings WHERE fingerprint = ?", (fingerprint,)
-    ).fetchone()
-
-    if row["version"] != expected_version:
-        raise FindingError(
-            "该发现已被其他人处置或链路已变化（指纹版本过期），请刷新队列后重试",
-            status_code=409,
-        )
-
-    now = _now()
-    if action == ACTION_RESOLVE:
-        if row["status"] != OPEN:
-            text = (
-                "该发现已处理，无需重复操作"
-                if row["status"] == RESOLVED
-                else "该异常已随链路变更消除，无需处置"
+        if row["version"] != expected_version:
+            raise FindingError(
+                "该发现已被其他人处置或链路已变化（指纹版本过期），请刷新队列后重试",
+                status_code=409,
             )
-            raise FindingError(text, status_code=409)
-        cur = conn.execute(
-            "UPDATE findings SET status = ?, handler = ?, note = ?, resolved_at = ?, "
-            "version = version + 1, updated_at = ? "
-            "WHERE id = ? AND version = ? AND status = ?",
-            (RESOLVED, handler, note, now, now, row["id"], expected_version, OPEN),
-        )
-        if not cur.rowcount:
-            raise FindingError("该发现状态已变化，请刷新队列后重试", status_code=409)
-        _record_transition(conn, row["id"], OPEN, RESOLVED, handler, note or "标记已处理", now)
-    elif action == ACTION_REOPEN:
-        if row["status"] != RESOLVED:
-            text = (
-                "该发现当前为未处理状态，无需重新打开"
-                if row["status"] == OPEN
-                else "该异常已随链路变更消除，不能重新打开"
-            )
-            raise FindingError(text, status_code=409)
-        cur = conn.execute(
-            "UPDATE findings SET status = ?, handler = ?, note = ?, resolved_at = NULL, "
-            "version = version + 1, updated_at = ? "
-            "WHERE id = ? AND version = ? AND status = ?",
-            (OPEN, handler, note, now, row["id"], expected_version, RESOLVED),
-        )
-        if not cur.rowcount:
-            raise FindingError("该发现状态已变化，请刷新队列后重试", status_code=409)
-        _record_transition(conn, row["id"], RESOLVED, OPEN, handler, note or "重新打开", now)
-    else:
-        raise FindingError("不支持的处置动作", status_code=400)
 
-    detail = get_finding_detail(conn, fingerprint)
-    sync_all_findings(conn)
-    detail["summary"] = queue_summary(conn)
-    return detail
+        now = _now()
+        if action == ACTION_RESOLVE:
+            if row["status"] != OPEN:
+                text = (
+                    "该发现已处理，无需重复操作"
+                    if row["status"] == RESOLVED
+                    else "该异常已随链路变更消除，无需处置"
+                )
+                raise FindingError(text, status_code=409)
+            # 只有当前（租约未到期的）认领人可以标记已处理
+            if not row["claimed_by"]:
+                raise FindingError("请先认领该发现，再标记已处理", status_code=409)
+            if row["claimed_by"] != handler:
+                raise FindingError(
+                    f"该发现已由 {row['claimed_by']} 认领，只有当前认领人可以标记已处理",
+                    status_code=409,
+                )
+            if claim_state(row) != CLAIM_CLAIMED:
+                raise FindingError(
+                    f"{handler} 的认领租约已到期，请重新认领 / 接管后再处置",
+                    status_code=409,
+                )
+            cur = conn.execute(
+                "UPDATE findings SET status = ?, handler = ?, note = ?, resolved_at = ?, "
+                "claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL, "
+                "version = version + 1, updated_at = ? "
+                "WHERE id = ? AND version = ? AND status = ?",
+                (RESOLVED, handler, note, now, now, row["id"], expected_version, OPEN),
+            )
+            if not cur.rowcount:
+                raise FindingError("该发现状态已变化，请刷新队列后重试", status_code=409)
+            _record_transition(conn, row["id"], OPEN, RESOLVED, handler, note or "标记已处理", now)
+        elif action == ACTION_REOPEN:
+            if row["status"] != RESOLVED:
+                text = (
+                    "该发现当前为未处理状态，无需重新打开"
+                    if row["status"] == OPEN
+                    else "该异常已随链路变更消除，不能重新打开"
+                )
+                raise FindingError(text, status_code=409)
+            cur = conn.execute(
+                "UPDATE findings SET status = ?, handler = ?, note = ?, resolved_at = NULL, "
+                "claimed_by = NULL, claimed_at = NULL, claim_expires_at = NULL, "
+                "version = version + 1, updated_at = ? "
+                "WHERE id = ? AND version = ? AND status = ?",
+                (OPEN, handler, note, now, row["id"], expected_version, RESOLVED),
+            )
+            if not cur.rowcount:
+                raise FindingError("该发现状态已变化，请刷新队列后重试", status_code=409)
+            _record_transition(conn, row["id"], RESOLVED, OPEN, handler, note or "重新打开", now)
+        else:
+            raise FindingError("不支持的处置动作", status_code=400)
+
+        detail = get_finding_detail(conn, fingerprint)
+        sync_all_findings(conn)
+        detail["summary"] = queue_summary(conn)
+        return detail

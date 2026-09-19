@@ -45,7 +45,7 @@
         <section class="card">
           <div class="card-head">
             <h3>异常处置队列</h3>
-            <span class="head-hint">跨样本汇总审计发现；身份按「样本 + 关联事件 + 异常类型 + 时间边界」稳定指纹跟踪，链路编辑后自动重算</span>
+            <span class="head-hint">跨样本汇总审计发现；稳定指纹跟踪、链路编辑后自动重算；未处理发现可限时认领 15 分钟，到期后他人可接管</span>
           </div>
           <div id="queue-stats" class="handover-stats"></div>
           <form id="queue-filter-form" class="event-form">
@@ -78,6 +78,14 @@
                   <option value="all">全部</option>
                 </select>
               </label>
+              <label>认领状态
+                <select id="q-claim">
+                  <option value="" selected>全部</option>
+                  <option value="unclaimed">未认领</option>
+                  <option value="claimed">认领中（15 分钟内）</option>
+                  <option value="expired">已过期（可接管）</option>
+                </select>
+              </label>
             </div>
             <div class="form-actions">
               <button type="submit" class="btn btn-primary">筛选</button>
@@ -96,6 +104,7 @@
                   <th>关联经手人</th>
                   <th>发生时间</th>
                   <th>状态</th>
+                  <th>限时认领</th>
                   <th>处置信息</th>
                   <th>操作</th>
                 </tr>
@@ -413,6 +422,26 @@
     </div>
   </div>
 
+  <!-- 限时认领 / 接管 / 释放弹窗 -->
+  <div id="claim-modal" class="modal-mask" hidden>
+    <div class="modal">
+      <h3 id="claim-title">限时认领审计发现</h3>
+      <div id="claim-body" class="dispose-body"></div>
+      <form id="claim-form">
+        <label id="claim-handler-label">认领人
+          <input type="text" id="cl-handler" maxlength="64" placeholder="如：审计员 王敏" required />
+        </label>
+        <label id="claim-note-label" hidden>备注
+          <input type="text" id="cl-note" maxlength="512" placeholder="可选，如：先让出给同事处理" />
+        </label>
+        <div class="form-actions">
+          <button type="submit" id="cl-submit" class="btn btn-primary">认领（15 分钟）</button>
+          <button type="button" id="btn-close-claim" class="btn btn-ghost">取消</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- 异常处置弹窗 -->
   <div id="dispose-modal" class="modal-mask" hidden>
     <div class="modal">
@@ -420,7 +449,7 @@
       <div id="dispose-body" class="dispose-body"></div>
       <form id="dispose-form">
         <label>处置人
-          <input type="text" id="dp-handler" maxlength="64" placeholder="如：审计员 王敏" required />
+          <input type="text" id="dp-handler" maxlength="64" placeholder="须为当前认领人" required />
         </label>
         <label>备注
           <input type="text" id="dp-note" maxlength="512" placeholder="可选，如：已联系当事人补齐交接手续" />

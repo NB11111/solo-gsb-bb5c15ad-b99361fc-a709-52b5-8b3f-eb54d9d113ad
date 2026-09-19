@@ -115,38 +115,47 @@ CREATE INDEX IF NOT EXISTS idx_handovers_pair
 -- （样本 + 关联事件 + 异常类型 + 时间边界），与列表顺序无关；
 -- 链路变更后重算：仍存在沿用状态、消失转已消除、新出现未处理。
 -- version 为乐观锁：处置写入必须携带客户端看到的版本，过期返回 409。
+-- claimed_by / claimed_at / claim_expires_at 为限时认领租约：未处理发现可被
+-- 处置人认领 15 分钟（CLAIM_TTL_SECONDS），租期内其他人认领返回 409；
+-- 到期后任何人可接管（版本递增）。异常被系统消除时租约随状态一并失效。
 CREATE TABLE IF NOT EXISTS findings (
-    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    fingerprint   TEXT    NOT NULL UNIQUE,
-    sample_id     INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
-    code          TEXT    NOT NULL,
-    kind          TEXT    NOT NULL,
-    message       TEXT    NOT NULL,
-    event_ids     TEXT    NOT NULL DEFAULT '[]',
-    custodians    TEXT    NOT NULL DEFAULT '[]',
-    time_from     TEXT,
-    time_to       TEXT,
-    status        TEXT    NOT NULL DEFAULT 'open',
-    handler       TEXT,
-    note          TEXT    NOT NULL DEFAULT '',
-    version       INTEGER NOT NULL DEFAULT 1,
-    first_seen_at TEXT    NOT NULL,
-    last_seen_at  TEXT    NOT NULL,
-    resolved_at   TEXT,
-    eliminated_at TEXT,
-    created_at    TEXT    NOT NULL,
-    updated_at    TEXT    NOT NULL
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    fingerprint       TEXT    NOT NULL UNIQUE,
+    sample_id         INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    code              TEXT    NOT NULL,
+    kind              TEXT    NOT NULL,
+    message           TEXT    NOT NULL,
+    event_ids         TEXT    NOT NULL DEFAULT '[]',
+    custodians        TEXT    NOT NULL DEFAULT '[]',
+    time_from         TEXT,
+    time_to           TEXT,
+    status            TEXT    NOT NULL DEFAULT 'open',
+    handler           TEXT,
+    note              TEXT    NOT NULL DEFAULT '',
+    claimed_by        TEXT,
+    claimed_at        TEXT,
+    claim_expires_at  TEXT,
+    version           INTEGER NOT NULL DEFAULT 1,
+    first_seen_at     TEXT    NOT NULL,
+    last_seen_at      TEXT    NOT NULL,
+    resolved_at       TEXT,
+    eliminated_at     TEXT,
+    created_at        TEXT    NOT NULL,
+    updated_at        TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_findings_sample ON findings(sample_id);
 CREATE INDEX IF NOT EXISTS idx_findings_status ON findings(status);
 
--- 状态迁移记录：首次出现、人工处置与系统自动迁移（消除 / 复现）全部留痕
+-- 状态迁移记录：首次出现、人工处置、限时认领（认领 / 释放 / 过期接管）
+-- 与系统自动迁移（消除 / 复现）全部留痕。event 标明具体迁移事件；
+-- from_status / to_status 为发现处置状态（认领类迁移中两者保持一致）。
 CREATE TABLE IF NOT EXISTS finding_transitions (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     finding_id  INTEGER NOT NULL REFERENCES findings(id) ON DELETE CASCADE,
     from_status TEXT,
     to_status   TEXT    NOT NULL,
+    event       TEXT    NOT NULL DEFAULT 'state',
     handler     TEXT,
     note        TEXT    NOT NULL DEFAULT '',
     created_at  TEXT    NOT NULL
@@ -156,10 +165,32 @@ CREATE INDEX IF NOT EXISTS idx_ftrans_finding ON finding_transitions(finding_id)
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对旧版本库做轻量列补齐（CREATE TABLE IF NOT EXISTS 不会改已有表）。
+
+    * findings 增加限时认领租约三列 claimed_by / claimed_at / claim_expires_at；
+    * finding_transitions 增加 event 列（state/claim/release/takeover/lease_void）。
+    旧迁移记录没有认领事件概念，统一回填为 state。
+    """
+    finding_cols = {r["name"] for r in conn.execute("PRAGMA table_info(findings)")}
+    for name, ddl in (
+        ("claimed_by", "ALTER TABLE findings ADD COLUMN claimed_by TEXT"),
+        ("claimed_at", "ALTER TABLE findings ADD COLUMN claimed_at TEXT"),
+        ("claim_expires_at", "ALTER TABLE findings ADD COLUMN claim_expires_at TEXT"),
+    ):
+        if name not in finding_cols:
+            conn.execute(ddl)
+    trans_cols = {r["name"] for r in conn.execute("PRAGMA table_info(finding_transitions)")}
+    if "event" not in trans_cols:
+        conn.execute("ALTER TABLE finding_transitions ADD COLUMN event TEXT NOT NULL DEFAULT 'state'")
+        conn.execute("UPDATE finding_transitions SET event = 'state' WHERE event IS NULL OR event = ''")
+
+
 def init_db() -> None:
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
     with db() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         _seed_demo_data(conn)
 
 

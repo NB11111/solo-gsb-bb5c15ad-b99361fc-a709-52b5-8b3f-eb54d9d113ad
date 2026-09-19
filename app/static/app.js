@@ -13,9 +13,11 @@
     confirmPair: null,   // 当前确认弹窗对应的交接项 { fromId, toId }
     view: "sample",      // 主区域当前视图：sample（样本详情）| queue（异常处置队列）
     queue: {
-      filters: { status: "open", code: "", custodian: "", time_from: "", time_to: "" },
+      filters: { status: "open", code: "", custodian: "", time_from: "", time_to: "", claim: "" },
       data: null,        // 最近一次队列响应
       dispose: null,     // 当前处置弹窗目标 { fp, version, action }
+      claim: null,       // 当前认领弹窗目标 { fp, version, mode }
+      countdownTimer: null, // 剩余时间倒计时 / 到期自动刷新
     },
   };
 
@@ -94,6 +96,11 @@
     adjacency_changed: "两条记录不再相邻",
   };
   const FINDING_STATUS_LABEL = { open: "未处理", resolved: "已处理", eliminated: "已消除" };
+  const CLAIM_STATUS_LABEL = { unclaimed: "未认领", claimed: "认领中", expired: "已过期" };
+  const CLAIM_EVENT_LABEL = {
+    state: "状态迁移", claim: "限时认领", release: "主动释放",
+    takeover: "过期接管", lease_void: "租约失效",
+  };
 
   // ---------- 样本列表 ----------
 
@@ -127,6 +134,11 @@
     state.view = view;
     $("#btn-queue").classList.toggle("active", view === "queue");
     $("#queue-view").hidden = view !== "queue";
+    if (view !== "queue") {
+      // 离开队列视图时停止租约倒计时
+      clearInterval(state.queue.countdownTimer);
+      state.queue.countdownTimer = null;
+    }
     if (view === "queue") {
       $("#detail").hidden = true;
       $("#empty-state").hidden = true;
@@ -594,6 +606,7 @@
     if (f.custodian) params.set("custodian", f.custodian);
     if (f.time_from) params.set("time_from", f.time_from);
     if (f.time_to) params.set("time_to", f.time_to);
+    if (f.claim) params.set("claim", f.claim);
     try {
       const data = await api(`/api/findings/queue?${params.toString()}`);
       state.queue.data = data;
@@ -604,12 +617,21 @@
     }
   }
 
+  function fmtRemaining(sec) {
+    if (sec == null) return "";
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    if (m <= 0) return `剩余 ${s} 秒`;
+    return `剩余 ${m} 分 ${String(s).padStart(2, "0")} 秒`;
+  }
+
   function renderQueue() {
     const data = state.queue.data;
     if (!data) return;
     const s = data.summary || {};
     $("#queue-stats").innerHTML = [
       statChip(s.open ?? 0, "未处理", s.open ? "bad" : ""),
+      statChip(s.claimed ?? 0, "认领中", "warn"),
       statChip(s.resolved ?? 0, "已处理", "ok"),
       statChip(s.eliminated ?? 0, "已消除", "muted"),
       statChip(s.total ?? 0, "累计发现", ""),
@@ -625,10 +647,31 @@
 
     const tbody = $("#queue-tbody");
     if (!data.items.length) {
-      tbody.innerHTML = `<tr><td colspan="8" class="muted-cell" style="text-align:center;padding:22px">当前筛选条件下没有审计发现</td></tr>`;
-      return;
+      tbody.innerHTML = `<tr><td colspan="9" class="muted-cell" style="text-align:center;padding:22px">当前筛选条件下没有审计发现</td></tr>`;
+    } else {
+      tbody.innerHTML = data.items.map(renderQueueRow).join("");
     }
-    tbody.innerHTML = data.items.map(renderQueueRow).join("");
+    scheduleLeaseCountdown(data);
+  }
+
+  function renderClaimCell(it) {
+    if (it.status !== "open") {
+      return `<span class="muted-cell">—</span>`;
+    }
+    if (it.claim_state === "claimed") {
+      return `<span class="badge badge-warn claim-badge">认领中</span>
+        <div class="muted-cell">${esc(it.claimed_by || "")}</div>
+        <div class="claim-remain" data-expires="${esc(it.claim_expires_at || "")}">
+          ${esc(fmtRemaining(it.claim_remaining_seconds))}
+        </div>
+        <div class="muted-cell">至 ${esc(it.claim_expires_at || "")}</div>`;
+    }
+    if (it.claim_state === "expired") {
+      return `<span class="badge badge-fail claim-badge">已过期·可接管</span>
+        <div class="muted-cell">原认领 ${esc(it.claimed_by || "")}</div>
+        <div class="muted-cell">至 ${esc(it.claim_expires_at || "")}</div>`;
+    }
+    return `<span class="badge badge-empty claim-badge">未认领</span>`;
   }
 
   function renderQueueRow(it) {
@@ -653,9 +696,20 @@
         : `<span class="muted-cell">—</span>`;
     const actions = [];
     if (it.status === "open") {
-      actions.push(
-        `<button class="link-btn btn-edit" data-dispose="resolve" data-fp="${it.fingerprint}" data-ver="${it.version}">处置</button>`
-      );
+      if (it.claim_state === "claimed") {
+        actions.push(
+          `<button class="link-btn btn-edit" data-dispose="resolve" data-fp="${it.fingerprint}" data-ver="${it.version}" data-claim="${esc(it.claimed_by || "")}">处置</button>`,
+          `<button class="link-btn btn-edit" data-release="${it.fingerprint}" data-ver="${it.version}">释放</button>`
+        );
+      } else if (it.claim_state === "expired") {
+        actions.push(
+          `<button class="link-btn btn-edit" data-claim="${it.fingerprint}" data-ver="${it.version}" data-mode="takeover" data-owner="${esc(it.claimed_by || "")}">接管</button>`
+        );
+      } else {
+        actions.push(
+          `<button class="link-btn btn-edit" data-claim="${it.fingerprint}" data-ver="${it.version}" data-mode="claim">认领</button>`
+        );
+      }
     } else if (it.status === "resolved") {
       actions.push(
         `<button class="link-btn btn-edit" data-dispose="reopen" data-fp="${it.fingerprint}" data-ver="${it.version}">重新打开</button>`
@@ -676,9 +730,37 @@
         <td>${it.custodians.map(esc).join("、") || "—"}</td>
         <td>${timeRange}</td>
         <td>${statusBadge}<div class="muted-cell">首次 ${esc(it.first_seen_at)}</div></td>
+        <td>${renderClaimCell(it)}</td>
         <td>${disposeInfo}</td>
         <td style="white-space:nowrap">${actions.join("")}</td>
       </tr>`;
+  }
+
+  // 租约倒计时：每秒刷新剩余时间；最近一条未到期租约到期时自动重排队列
+  function scheduleLeaseCountdown(data) {
+    clearInterval(state.queue.countdownTimer);
+    const items = (data && data.items) || [];
+    let nextExpiry = Infinity;
+    const now = Date.now();
+    for (const it of items) {
+      if (it.claim_state !== "claimed" || !it.claim_expires_at) continue;
+      const t = new Date(it.claim_expires_at.replace(" ", "T")).getTime();
+      if (Number.isFinite(t) && t > now && t < nextExpiry) nextExpiry = t;
+    }
+    state.queue.countdownTimer = setInterval(() => {
+      const remainCells = document.querySelectorAll(".claim-remain[data-expires]");
+      let nearest = Infinity;
+      remainCells.forEach((el) => {
+        const t = new Date(el.dataset.expires.replace(" ", "T")).getTime();
+        const left = Math.max(0, Math.floor((t - Date.now()) / 1000));
+        el.textContent = fmtRemaining(left);
+        if (t > Date.now() && t < nearest) nearest = t;
+      });
+      // 页面上最近一条租约到期 -> 行操作按钮需切换（认领/接管），重新拉取队列
+      if (!document.hidden && Number.isFinite(nearest) && nearest <= Date.now()) {
+        loadQueue();
+      }
+    }, 1000);
   }
 
   // 筛选表单
@@ -690,25 +772,48 @@
       custodian: $("#q-custodian").value.trim(),
       time_from: $("#q-from").value,
       time_to: $("#q-to").value,
+      claim: $("#q-claim").value,
     };
     loadQueue();
   });
   $("#btn-queue-reset").addEventListener("click", () => {
     $("#queue-filter-form").reset();
     $("#q-status").value = "open";
-    state.queue.filters = { status: "open", code: "", custodian: "", time_from: "", time_to: "" };
+    $("#q-claim").value = "";
+    state.queue.filters = { status: "open", code: "", custodian: "", time_from: "", time_to: "", claim: "" };
     loadQueue();
   });
   $("#btn-queue-refresh").addEventListener("click", loadQueue);
 
-  // 队列行操作：处置 / 重新打开 / 迁移记录
+  // 队列行操作：认领 / 接管 / 释放 / 处置 / 重新打开 / 迁移记录
   $("#queue-tbody").addEventListener("click", (e) => {
+    const claimBtn = e.target.closest("button[data-claim][data-mode]");
+    if (claimBtn) {
+      openClaimModal(
+        claimBtn.dataset.claim,
+        Number(claimBtn.dataset.ver),
+        claimBtn.dataset.mode,
+        claimBtn.dataset.owner || ""
+      );
+      return;
+    }
+    const releaseBtn = e.target.closest("button[data-release]");
+    if (releaseBtn) {
+      openClaimModal(
+        releaseBtn.dataset.release,
+        Number(releaseBtn.dataset.ver),
+        "release",
+        ""
+      );
+      return;
+    }
     const disposeBtn = e.target.closest("button[data-dispose]");
     if (disposeBtn) {
       openDisposeModal(
         disposeBtn.dataset.fp,
         Number(disposeBtn.dataset.ver),
-        disposeBtn.dataset.dispose
+        disposeBtn.dataset.dispose,
+        disposeBtn.dataset.claim || ""
       );
       return;
     }
@@ -716,7 +821,107 @@
     if (histBtn) openFindingHistory(histBtn.dataset.history);
   });
 
-  function openDisposeModal(fp, version, action) {
+  function findingByFp(fp) {
+    const items = (state.queue.data && state.queue.data.items) || [];
+    return items.find((x) => x.fingerprint === fp);
+  }
+
+  // ---------- 限时认领 / 接管 / 释放弹窗 ----------
+
+  function openClaimModal(fp, version, mode, owner) {
+    const it = findingByFp(fp);
+    if (!it) return;
+    state.queue.claim = { fp, version, mode };
+    const isRelease = mode === "release";
+    const isTakeover = mode === "takeover";
+    $("#claim-title").textContent =
+      isRelease ? "主动释放认领" : isTakeover ? "接管过期认领" : "限时认领审计发现";
+    $("#claim-body").innerHTML = `
+      <div class="dispose-finding">
+        <div><span class="meta-lbl">样本</span>${esc(it.sample.code)} · ${esc(it.sample.name)}</div>
+        <div><span class="meta-lbl">类型</span>${esc(FINDING_LABEL[it.code] || it.code)}</div>
+        <div><span class="meta-lbl">发现</span>${esc(it.message)}</div>
+        <div><span class="meta-lbl">指纹版本</span><code class="digest">${esc(
+          it.fingerprint.slice(0, 12)
+        )}</code> · v${it.version}</div>
+        ${
+          it.claim_state === "claimed"
+            ? `<div><span class="meta-lbl">当前认领</span>${esc(it.claimed_by)}（${esc(
+                fmtRemaining(it.claim_remaining_seconds)
+              )}，至 ${esc(it.claim_expires_at)}）</div>`
+            : it.claim_state === "expired"
+            ? `<div><span class="meta-lbl">原认领</span>${esc(
+                it.claimed_by
+              )}，租约已到期，可由他人接管（版本递增）</div>`
+            : ""
+        }
+      </div>
+      <p class="muted-cell ho-modal-hint">${
+        isRelease
+          ? "只有当前认领人可以主动释放；释放后其他人可立即认领。"
+          : "认领与接管在服务端单事务内先重算发现、再同时校验指纹版本与租约状态；未到期被他人占用时返回 409。"
+      }</p>`;
+    $("#claim-handler-label").hidden = false;
+    $("#cl-handler").value =
+      isRelease && it.claimed_by ? it.claimed_by : "";
+    $("#cl-handler").placeholder = isRelease
+      ? "须为当前认领人"
+      : isTakeover
+      ? "接管人，如：审计员 李强"
+      : "认领人，如：审计员 王敏";
+    $("#claim-note-label").hidden = !isRelease;
+    $("#cl-submit").textContent =
+      isRelease ? "释放认领" : isTakeover ? "接管（续租 15 分钟）" : "认领（15 分钟）";
+    $("#claim-form").reset();
+    if (isRelease && it.claimed_by) $("#cl-handler").value = it.claimed_by;
+    $("#claim-modal").hidden = false;
+    $("#cl-handler").focus();
+  }
+
+  const claimModal = $("#claim-modal");
+  $("#btn-close-claim").addEventListener("click", () => (claimModal.hidden = true));
+  claimModal.addEventListener("click", (e) => {
+    if (e.target === claimModal) claimModal.hidden = true;
+  });
+
+  $("#claim-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const c = state.queue.claim;
+    if (!c) return;
+    const handler = $("#cl-handler").value.trim();
+    if (!handler) {
+      toast("请填写认领人", true);
+      return;
+    }
+    const payload = { expected_version: c.version, handler };
+    const path =
+      c.mode === "release"
+        ? `/api/findings/${c.fp}/release`
+        : `/api/findings/${c.fp}/claim`;
+    if (c.mode === "release") payload.note = $("#cl-note").value.trim();
+    try {
+      await api(path, { method: "POST", body: JSON.stringify(payload) });
+      claimModal.hidden = true;
+      state.queue.claim = null;
+      toast(
+        c.mode === "release"
+          ? "已释放认领"
+          : c.mode === "takeover"
+          ? "已接管，新租约 15 分钟"
+          : "认领成功，租约 15 分钟"
+      );
+      await loadQueue();
+    } catch (err) {
+      if (err.status === 409 || err.status === 404) {
+        claimModal.hidden = true;
+        state.queue.claim = null;
+        await loadQueue();
+      }
+      toast(err.message, true);
+    }
+  });
+
+  function openDisposeModal(fp, version, action, currentClaim) {
     const items = (state.queue.data && state.queue.data.items) || [];
     const it = items.find((x) => x.fingerprint === fp);
     if (!it) return;
@@ -731,10 +936,18 @@
         <div><span class="meta-lbl">指纹版本</span><code class="digest">${esc(
           it.fingerprint.slice(0, 12)
         )}</code> · v${it.version}</div>
+        ${
+          action === "resolve" && it.claim_state === "claimed"
+            ? `<div><span class="meta-lbl">当前认领</span>${esc(
+                it.claimed_by
+              )}（${esc(fmtRemaining(it.claim_remaining_seconds))}），仅当前认领人可标记已处理</div>`
+            : ""
+        }
       </div>
-      <p class="muted-cell ho-modal-hint">提交时服务端将校验该指纹版本；若期间链路或状态已变化，将返回冲突并自动刷新队列。</p>`;
+      <p class="muted-cell ho-modal-hint">提交时服务端将在单一事务内先重算发现，再同时校验指纹版本与认领租约；若期间链路、状态或认领已变化，将返回冲突并自动刷新队列。</p>`;
     $("#dp-submit").textContent = action === "resolve" ? "标记已处理" : "重新打开";
     $("#dispose-form").reset();
+    if (action === "resolve" && currentClaim) $("#dp-handler").value = currentClaim;
     $("#dispose-modal").hidden = false;
     $("#dp-handler").focus();
   }
@@ -787,19 +1000,44 @@
       const d = await api(`/api/findings/${fp}`);
       const rows = (d.transitions || [])
         .map((t) => {
-          const move = t.from_status
-            ? `${FINDING_STATUS_LABEL[t.from_status] || t.from_status} → ${
-                FINDING_STATUS_LABEL[t.to_status] || t.to_status
-              }`
-            : `首次出现（${FINDING_STATUS_LABEL[t.to_status] || t.to_status}）`;
+          let move;
+          if (t.event && t.event !== "state") {
+            // 认领 / 释放 / 过期接管 / 租约失效：处置状态本身可能不变，
+            // 以事件标签为主、状态迁移为副
+            const evLabel = CLAIM_EVENT_LABEL[t.event] || t.event_text || t.event;
+            move = `${esc(evLabel)}<div class="muted-cell">${
+              t.from_status
+                ? esc(FINDING_STATUS_LABEL[t.from_status] || t.from_status) +
+                  " → " + esc(FINDING_STATUS_LABEL[t.to_status] || t.to_status)
+                : "—"
+            }</div>`;
+          } else if (t.from_status) {
+            move = `${FINDING_STATUS_LABEL[t.from_status] || t.from_status} → ${
+              FINDING_STATUS_LABEL[t.to_status] || t.to_status
+            }`;
+          } else {
+            move = `首次出现（${FINDING_STATUS_LABEL[t.to_status] || t.to_status}）`;
+          }
           return `<tr>
             <td>${esc(t.created_at)}</td>
-            <td>${esc(move)}</td>
+            <td>${move}</td>
             <td>${t.handler ? esc(t.handler) : '<span class="muted-cell">系统</span>'}</td>
             <td>${esc(t.note || "—")}</td>
           </tr>`;
         })
         .join("");
+      const leaseInfo =
+        d.status === "open"
+          ? d.claim_state === "claimed"
+            ? `<div><span class="meta-lbl">限时认领</span>${esc(d.claimed_by)} · ${esc(
+                fmtRemaining(d.claim_remaining_seconds)
+              )}（至 ${esc(d.claim_expires_at)}）</div>`
+            : d.claim_state === "expired"
+            ? `<div><span class="meta-lbl">限时认领</span>已过期，原认领 ${esc(
+                d.claimed_by
+              )}，可接管</div>`
+            : `<div><span class="meta-lbl">限时认领</span>未认领（可认领 15 分钟）</div>`
+          : "";
       $("#finding-history-body").innerHTML = `
         <div class="signoff-meta">
           <div><span class="meta-lbl">样本</span>${esc(d.sample.code)} · ${esc(d.sample.name)}</div>
@@ -807,6 +1045,7 @@
           <div><span class="meta-lbl">当前状态</span>${esc(
             FINDING_STATUS_LABEL[d.status] || d.status
           )}（v${d.version}）</div>
+          ${leaseInfo}
           <div><span class="meta-lbl">稳定指纹</span><code class="digest">${esc(d.fingerprint)}</code></div>
           <div><span class="meta-lbl">首次出现</span>${esc(d.first_seen_at)}</div>
           <div><span class="meta-lbl">最近出现</span>${esc(d.last_seen_at)}</div>
@@ -814,7 +1053,7 @@
         <p class="conclusion">${esc(d.message)}</p>
         <div class="table-wrap">
           <table class="event-table">
-            <thead><tr><th>时间</th><th>状态迁移</th><th>操作人</th><th>备注</th></tr></thead>
+            <thead><tr><th>时间</th><th>迁移事件</th><th>操作人</th><th>备注</th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
         </div>`;

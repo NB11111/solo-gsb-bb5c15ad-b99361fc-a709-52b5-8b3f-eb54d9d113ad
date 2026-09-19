@@ -87,6 +87,27 @@ def _dispose(client, fp, action, version, handler="王敏", note=""):
     )
 
 
+def _claim(client, fp, version, handler="王敏"):
+    return client.post(
+        f"/api/findings/{fp}/claim",
+        json={"expected_version": version, "handler": handler},
+    )
+
+
+def _release(client, fp, version, handler="王敏", note=""):
+    return client.post(
+        f"/api/findings/{fp}/release",
+        json={"expected_version": version, "handler": handler, "note": note},
+    )
+
+
+def _claim_and_resolve(client, fp, version, handler="王敏", note=""):
+    """测试助手：先认领（默认 15 分钟租约），再由同一认领人标记已处理。"""
+    claimed = _claim(client, fp, version, handler=handler)
+    assert claimed.status_code == 200, claimed.text
+    return _dispose(client, fp, "resolve", claimed.json()["version"], handler=handler, note=note)
+
+
 def test_queue_cross_sample_and_stable_fingerprint(client, sample):
     sid, e1, e2 = _make_gap_sample(client, sample)
     data = _queue(client)
@@ -111,42 +132,52 @@ def test_dispose_resolve_reopen_and_version_conflict(client, sample):
     item = _items_of(_queue(client), sid, "gap")[0]
     fp, ver = item["fingerprint"], item["version"]
 
-    # 标记已处理
-    resp = _dispose(client, fp, "resolve", ver, note="已补充交接说明")
+    # 标记已处理（只有当前认领人可以处置）：认领 v1 -> v2，处置 v2 -> v3
+    resp = _claim_and_resolve(client, fp, ver, note="已补充交接说明")
     assert resp.status_code == 200
     detail = resp.json()
     assert detail["status"] == "resolved"
     assert detail["handler"] == "王敏"
     assert detail["note"] == "已补充交接说明"
-    assert detail["version"] == ver + 1
+    assert detail["version"] == ver + 2
     assert detail["resolved_at"]
+    assert detail["claimed_by"] is None
 
     # 过期版本再次处置 -> 409 冲突
     assert _dispose(client, fp, "resolve", ver).status_code == 409
     # 当前版本但状态不允许（已处理不能重复标记）-> 409
-    assert _dispose(client, fp, "resolve", ver + 1).status_code == 409
+    assert _dispose(client, fp, "resolve", ver + 2).status_code == 409
     # 重新打开携带旧版本 -> 409
     assert _dispose(client, fp, "reopen", ver).status_code == 409
 
-    # 当前版本重新打开 -> 成功，回到未处理
-    ok = _dispose(client, fp, "reopen", ver + 1, note="复核发现仍需补手续")
+    # 当前版本重新打开 -> 成功，回到未处理（未认领）
+    ok = _dispose(client, fp, "reopen", ver + 2, note="复核发现仍需补手续")
     assert ok.status_code == 200
     assert ok.json()["status"] == "open"
     assert ok.json()["resolved_at"] is None
+    assert ok.json()["claimed_by"] is None
 
-    # 状态迁移记录完整留痕
+    # 状态迁移记录完整留痕（过滤认领类事件后只看处置状态迁移）
     detail = client.get(f"/api/findings/{fp}").json()
-    moves = [(t["from_status"], t["to_status"]) for t in detail["transitions"]]
+    moves = [
+        (t["from_status"], t["to_status"])
+        for t in detail["transitions"]
+        if t["event"] == "state"
+    ]
     assert moves == [(None, "open"), ("open", "resolved"), ("resolved", "open")]
-    assert detail["transitions"][1]["handler"] == "王敏"
-    assert detail["transitions"][1]["note"] == "已补充交接说明"
+    resolve_row = next(
+        t for t in detail["transitions"]
+        if t["from_status"] == "open" and t["to_status"] == "resolved"
+    )
+    assert resolve_row["handler"] == "王敏"
+    assert resolve_row["note"] == "已补充交接说明"
 
 
 def test_state_kept_when_fingerprint_unchanged(client, sample):
     sid, _, e2 = _make_gap_sample(client, sample)
     item = _items_of(_queue(client), sid, "gap")[0]
     fp = item["fingerprint"]
-    assert _dispose(client, fp, "resolve", item["version"], note="已核实").status_code == 200
+    assert _claim_and_resolve(client, fp, item["version"], note="已核实").status_code == 200
 
     # 仅编辑经手人（异常类型 / 关联事件 / 时间边界均不变）-> 指纹不变，处置状态沿用
     resp = client.put(
@@ -217,9 +248,9 @@ def test_disappear_eliminated_and_reappear_reopens(client, sample):
 def test_new_findings_stay_open_after_chain_edit(client, sample):
     sid, _, _ = _make_gap_sample(client, sample)
     item = _items_of(_queue(client), sid, "gap")[0]
-    assert _dispose(client, item["fingerprint"], "resolve", item["version"]).status_code == 200
+    assert _claim_and_resolve(client, item["fingerprint"], item["version"]).status_code == 200
 
-    # 新增事件制造重叠 -> 新异常未处理；原断档已处理状态不受影响
+    # 新事件制造重叠 -> 新异常未处理；原断档已处理状态不受影响
     _add_event(client, sid, "王五", "2026-09-18 10:45:00", "2026-09-18 12:00:00")
     open_items = _items_of(_queue(client), sid)
     assert any(it["code"] == "overlap" and it["status"] == "open" for it in open_items)

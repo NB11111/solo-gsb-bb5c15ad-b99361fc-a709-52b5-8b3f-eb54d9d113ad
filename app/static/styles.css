@@ -126,6 +126,11 @@ body {
 .badge-warning { background: var(--warn-bg); color: var(--warn-text); }
 .badge-fail { background: var(--bad-bg); color: var(--bad-text); }
 .badge-empty { background: #eef1f4; color: var(--muted); }
+.badge-warn { background: var(--warn-bg); color: var(--warn-text); }
+
+/* 限时认领列 */
+.claim-badge { display: inline-block; margin-bottom: 2px; }
+.claim-remain { font-size: 12.5px; font-weight: 600; color: var(--warn-text); white-space: nowrap; }
 
 .conclusion { margin: 6px 0 14px; font-size: 14.5px; line-height: 1.8; }
 .stats { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px; }

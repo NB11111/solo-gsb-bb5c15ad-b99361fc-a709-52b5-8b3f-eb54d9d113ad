@@ -25,10 +25,12 @@ from .db import get_conn, init_db
 from .findings import (
     FindingError,
     build_queue,
+    claim_finding,
     dispose_finding,
     get_finding_detail,
     normalize_bound,
     queue_summary,
+    release_finding,
     sync_all_findings,
     sync_sample_findings,
 )
@@ -43,7 +45,9 @@ from .report import build_html, build_json, build_markdown
 from .schemas import (
     BulkImportConfirm,
     EventCreate,
+    FindingClaim,
     FindingDispose,
+    FindingRelease,
     HandoverConfirm,
     SampleCreate,
     SignoffCreate,
@@ -345,9 +349,10 @@ def findings_queue(
     custodian: Optional[str] = Query(None),
     time_from: Optional[str] = Query(None),
     time_to: Optional[str] = Query(None),
+    claim: Optional[str] = Query(None, pattern="^(unclaimed|claimed|expired)$"),
     conn: Connection = Depends(get_conn),
 ) -> dict[str, Any]:
-    """跨样本异常处置队列：按状态 / 异常类型 / 经手人 / 发生时间筛选。"""
+    """跨样本异常处置队列：按状态 / 异常类型 / 经手人 / 发生时间 / 认领状态筛选。"""
     try:
         bound_from = normalize_bound(time_from, "发生时间从")
         bound_to = normalize_bound(time_to, "发生时间至")
@@ -358,6 +363,7 @@ def findings_queue(
             custodian=custodian,
             time_from=bound_from,
             time_to=bound_to,
+            claim=claim,
         )
     except FindingError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
@@ -365,9 +371,42 @@ def findings_queue(
 
 @app.get("/api/findings/{fingerprint}")
 def finding_detail(fingerprint: str, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
-    """发现详情：当前状态 + 完整状态迁移记录（含系统自动迁移）。"""
+    """发现详情：当前状态 + 完整状态迁移记录（含认领 / 释放 / 过期接管）。"""
     try:
         return get_finding_detail(conn, fingerprint)
+    except FindingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/findings/{fingerprint}/claim")
+def finding_claim(
+    fingerprint: str, payload: FindingClaim, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """限时认领未处理发现（15 分钟租约）；租约到期后同一接口即接管。
+
+    服务端在单一事务内先按当前链路重算发现，再同时校验 expected_version
+    与租约状态：租约未到期且属于他人返回 409；到期 / 未认领 / 已释放则
+    认领或接管成功并递增版本。
+    """
+    try:
+        return claim_finding(conn, fingerprint, payload.handler, payload.expected_version)
+    except FindingError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/findings/{fingerprint}/release")
+def finding_release(
+    fingerprint: str, payload: FindingRelease, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """主动释放认领：只有当前未到期租约的认领人可以释放（版本递增）。"""
+    try:
+        return release_finding(
+            conn,
+            fingerprint,
+            payload.handler,
+            payload.expected_version,
+            payload.note,
+        )
     except FindingError as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
@@ -378,8 +417,9 @@ def finding_dispose(
 ) -> dict[str, Any]:
     """处置写入：标记已处理 / 重新打开。
 
-    服务端先按当前链路重算指纹，再校验客户端看到的指纹版本
-    （expected_version）；版本过期返回 409，客户端应刷新队列后重试。
+    服务端先在单一事务内按当前链路重算指纹，再同时校验客户端看到的指纹版本
+    （expected_version）与认领租约：只有当前认领人可标记已处理；版本过期、
+    租约冲突均返回 409，客户端应刷新队列后重试。
     """
     try:
         return dispose_finding(
