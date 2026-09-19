@@ -1,0 +1,24 @@
+services:
+  sample-audit:
+    build: .
+    image: sample-chain-audit:latest
+    container_name: sample-chain-audit
+    ports:
+      # 固定端口：宿主机 8080 -> 容器 8080
+      - "8080:8080"
+    environment:
+      APP_PORT: "8080"
+      AUDIT_DB_PATH: /data/audit.db
+    volumes:
+      # 数据库持久化，容器重建不丢数据
+      - audit-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/api/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 8s
+
+volumes:
+  audit-data:
